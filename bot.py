@@ -30,30 +30,42 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TelegramStoreBot")
 
-# Global Instances
+# Global Bot & Dispatcher Instances
 bot = Bot(token=settings.BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
+# Pricing Constants
+STAR_PRICE_PER_UNIT = 0.022  # $0.022 USD per Star
+STAR_SELL_RATE = 0.015       # $0.015 USD payout per Star
+
 # FSM States
 class DepositStates(StatesGroup):
     waiting_for_amount = State()
 
-class StarsBuyStates(StatesGroup):
-    waiting_for_recipient = State()
+class CustomStarsStates(StatesGroup):
     waiting_for_quantity = State()
+    waiting_for_recipient = State()
+
+class PremiumStates(StatesGroup):
+    waiting_for_recipient = State()
 
 class BoostBuyStates(StatesGroup):
     waiting_for_channel = State()
+    waiting_for_package = State()
 
 class SellStarsStates(StatesGroup):
     waiting_for_quantity = State()
 
+class GiveawayStates(StatesGroup):
+    waiting_for_prize = State()
+    waiting_for_winners = State()
+
 class SupportStates(StatesGroup):
     waiting_for_message = State()
 
-# Database Initialization
+# Database Setup
 async def init_db():
     async with aiosqlite.connect(settings.DB_PATH) as db:
         await db.execute("""
@@ -91,8 +103,14 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS giveaway_entries (
+                user_id INTEGER PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
-    logger.info("Database schemas initialized cleanly.")
+    logger.info("SQLite database tables initialized successfully.")
 
 # Helper Functions
 def generate_order_id() -> str:
@@ -113,7 +131,8 @@ async def get_or_create_user(user_id: int, username: str, first_name: str, refer
                 return {"user_id": user_id, "balance": 0.0, "total_spent": 0.0, "total_deposited": 0.0}
             return {"user_id": user[0], "balance": user[1], "total_spent": user[2], "total_deposited": user[3]}
 
-# Dynamic Colored UI Keyboards using Telegram API style parameters
+# --- KEYBOARD BUILDERS WITH THEMED BUTTON STYLES ---
+
 def get_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -153,7 +172,8 @@ def get_back_keyboard() -> InlineKeyboardMarkup:
         ]
     )
 
-# --- START & MENU COMMANDS ---
+# --- START & MAIN MENU HANDLERS ---
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -173,7 +193,8 @@ async def cmd_start(message: Message, state: FSMContext):
         f"💳 **Current Balance:** `${user_data['balance']:.2f} USD`\n"
         f"👤 **User ID:** `{message.from_user.id}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✨ Select a category below to buy Premium, Stars, Boosts, or manage your digital wallet:"
+        "✨ Premium Telegram Store Automation Platform.\n"
+        "Select an option below to get started:"
     )
     await message.answer(caption, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
@@ -187,17 +208,18 @@ async def cb_main(callback: CallbackQuery, state: FSMContext):
         f"💳 **Current Balance:** `${user_data['balance']:.2f} USD`\n"
         f"👤 **User ID:** `{callback.from_user.id}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Please choose an option below:"
+        "Choose a store category from below:"
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
-# --- BUY STARS FLOW ---
+# --- BUY STARS CUSTOM & PACKAGE FLOW ---
+
 @router.callback_query(F.data == "nav_buy_stars")
 async def cb_buy_stars(callback: CallbackQuery):
     text = (
         "⭐ **BUY TELEGRAM STARS**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Select your desired package below to top up Telegram Stars instantly:\n"
+        "Select a popular package or choose **Custom Amount** to specify any quantity:\n"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -212,120 +234,339 @@ async def cb_buy_stars(callback: CallbackQuery):
             InlineKeyboardButton(text="⭐ 2,500 Stars - $48.00", callback_data="buy_stars_2500", style="primary"),
             InlineKeyboardButton(text="⭐ 5,000 Stars - $95.00", callback_data="buy_stars_5000", style="primary")
         ],
+        [
+            InlineKeyboardButton(text="✏️ Type Custom Amount ⭐", callback_data="buy_stars_custom", style="primary")
+        ],
         [InlineKeyboardButton(text="❌ Back To Menu", callback_data="nav_main", style="danger")],
         [InlineKeyboardButton(text="💬 Contact Support", callback_data="nav_support", style="primary")]
     ])
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
 
-@router.callback_query(F.data.startswith("buy_stars_"))
-async def cb_select_stars_pkg(callback: CallbackQuery, state: FSMContext):
-    amount_str = callback.data.split("_")[2]
-    await state.update_data(stars_qty=amount_str)
-    await state.set_state(StarsBuyStates.waiting_for_recipient)
-    
+@router.callback_query(F.data == "buy_stars_custom")
+async def cb_stars_custom(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(CustomStarsStates.waiting_for_quantity)
     text = (
-        f"⭐ **CONFIRM STARS RECIPIENT**\n"
+        "✍️ **CUSTOM STARS QUANTITY**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "How many Stars would you like to purchase?\n\n"
+        "📌 *Enter any number between 10 and 100,000:* "
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+
+@router.message(CustomStarsStates.waiting_for_quantity)
+async def process_custom_stars_qty(message: Message, state: FSMContext):
+    try:
+        qty = int(message.text.strip())
+        if qty < 10 or qty > 100000:
+            raise ValueError()
+    except ValueError:
+        await message.answer("⚠️ Please enter a valid whole number between 10 and 100,000.")
+        return
+
+    price = qty * STAR_PRICE_PER_UNIT
+    await state.update_data(stars_qty=qty, total_price=price)
+    await state.set_state(CustomStarsStates.waiting_for_recipient)
+
+    text = (
+        f"⭐ **TARGET RECIPIENT**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Selected Package: **{amount_str} Telegram Stars**\n\n"
-        f"Please send the target `@username` or Telegram User ID to receive the delivery:"
+        f"Quantity: **{qty:,} Stars**\n"
+        f"Total Cost: **${price:.2f} USD**\n\n"
+        f"Who is this gift/top-up for?\n"
+        f"• Click **Buy For Myself**\n"
+        f"• Or **TYPE and SEND** the recipient's `@username` below:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 Buy for Myself", callback_data="stars_self", style="success")],
-        [InlineKeyboardButton(text="❌ Cancel", callback_data="nav_main", style="danger")]
+        [InlineKeyboardButton(text="🎯 Buy For Myself", callback_data="stars_target_self", style="success")],
+        [InlineKeyboardButton(text="❌ Cancel Order", callback_data="nav_main", style="danger")]
+    ])
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
+@router.callback_query(F.data.startswith("buy_stars_") & (F.data != "buy_stars_custom"))
+async def cb_select_preset_stars(callback: CallbackQuery, state: FSMContext):
+    qty = int(callback.data.split("_")[2])
+    price = qty * STAR_PRICE_PER_UNIT
+    await state.update_data(stars_qty=qty, total_price=price)
+    await state.set_state(CustomStarsStates.waiting_for_recipient)
+
+    text = (
+        f"⭐ **TARGET RECIPIENT**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Quantity: **{qty:,} Stars**\n"
+        f"Total Cost: **${price:.2f} USD**\n\n"
+        f"Who is this gift/top-up for?\n"
+        f"• Click **Buy For Myself**\n"
+        f"• Or **TYPE and SEND** the recipient's `@username` below:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Buy For Myself", callback_data="stars_target_self", style="success")],
+        [InlineKeyboardButton(text="❌ Cancel Order", callback_data="nav_main", style="danger")]
     ])
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
 
-@router.callback_query(F.data == "stars_self")
-async def cb_stars_self(callback: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "stars_target_self")
+async def cb_stars_self_target(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    qty = data.get("stars_qty", "100")
+    qty = data.get("stars_qty", 100)
+    price = data.get("total_price", 2.50)
     recipient = f"@{callback.from_user.username}" if callback.from_user.username else str(callback.from_user.id)
-    await finalize_stars_order(callback.message, callback.from_user.id, qty, recipient, state)
+    await show_stars_payment_options(callback.message, callback.from_user.id, qty, price, recipient, state)
 
-@router.message(StarsBuyStates.waiting_for_recipient)
-async def process_stars_recipient(message: Message, state: FSMContext):
+@router.message(CustomStarsStates.waiting_for_recipient)
+async def process_stars_recipient_input(message: Message, state: FSMContext):
     data = await state.get_data()
-    qty = data.get("stars_qty", "100")
+    qty = data.get("stars_qty", 100)
+    price = data.get("total_price", 2.50)
     recipient = message.text.strip()
-    await finalize_stars_order(message, message.from_user.id, qty, recipient, state)
+    if not recipient.startswith("@") and not recipient.isdigit():
+        recipient = f"@{recipient}"
+    await show_stars_payment_options(message, message.from_user.id, qty, price, recipient, state)
 
-async def finalize_stars_order(message_obj, user_id: int, qty: str, recipient: str, state: FSMContext):
+async def show_stars_payment_options(msg_obj, user_id: int, qty: int, price: float, recipient: str, state: FSMContext):
     await state.clear()
     order_id = generate_order_id()
     
+    # Create pending order in DB
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO orders (order_id, user_id, product_type, product_id, amount, status, recipient) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (order_id, user_id, "stars", f"{qty}_stars", price, "awaiting_payment", recipient)
+        )
+        await db.commit()
+
     text = (
-        f"🧾 **ORDER SUMMARY & PAYMENT**\n"
+        f"📋 **ORDER DETAILS GENERATED**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"**Order ID:** `{order_id}`\n"
-        f"**Item:** Telegram Stars ({qty}x)\n"
-        f"**Recipient:** `{recipient}`\n"
-        f"**Status:** Pending Payment\n"
+        f"🆔 **Order ID:** `{order_id}`\n"
+        f"⭐ **Product:** Telegram Stars ({qty:,}x)\n"
+        f"👤 **Target Recipient:** `{recipient}`\n"
+        f"💵 **Total Payable:** `${price:.2f} USD`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Click below to proceed with crypto checkout via OxaPay:"
+        "Please choose your payment method below to proceed:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Pay with OxaPay Crypto", url=f"https://oxapay.com/pay/{order_id}", style="success")],
+        [InlineKeyboardButton(text="👛 Pay using Wallet Balance", callback_data=f"pay_bal_{order_id}", style="success")],
+        [InlineKeyboardButton(text="💳 Pay with OxaPay Crypto", url=f"https://oxapay.com/pay/{order_id}", style="primary")],
         [InlineKeyboardButton(text="❌ Cancel Order", callback_data="nav_main", style="danger")]
     ])
-    if isinstance(message_obj, Message):
-        await message_obj.answer(text, parse_mode="Markdown", reply_markup=kb)
+    if isinstance(msg_obj, Message):
+        await msg_obj.answer(text, parse_mode="Markdown", reply_markup=kb)
     else:
-        await message_obj.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        await msg_obj.edit_text(text, parse_mode="Markdown", reply_markup=kb)
 
 # --- BUY PREMIUM FLOW ---
+
 @router.callback_query(F.data == "nav_buy_premium")
 async def cb_buy_premium(callback: CallbackQuery):
     text = (
         "💎 **BUY TELEGRAM PREMIUM**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Select your preferred Telegram Premium plan:\n"
+        "Choose a Telegram Premium subscription duration:\n"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ 3 Months Premium - $13.99", callback_data="prem_3m", style="success")],
-        [InlineKeyboardButton(text="⭐ 6 Months Premium - $22.99", callback_data="prem_6m", style="success")],
-        [InlineKeyboardButton(text="⭐ 12 Months Premium - $39.99", callback_data="prem_12m", style="primary")],
+        [InlineKeyboardButton(text="⭐ 3 Months Premium - $13.99", callback_data="prem_select_3m", style="success")],
+        [InlineKeyboardButton(text="⭐ 6 Months Premium - $22.99", callback_data="prem_select_6m", style="success")],
+        [InlineKeyboardButton(text="⭐ 12 Months Premium - $39.99", callback_data="prem_select_12m", style="primary")],
         [InlineKeyboardButton(text="❌ Back To Menu", callback_data="nav_main", style="danger")]
     ])
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
 
+@router.callback_query(F.data.startswith("prem_select_"))
+async def cb_premium_recipient(callback: CallbackQuery, state: FSMContext):
+    plan = callback.data.split("_")[2]
+    prices = {"3m": 13.99, "6m": 22.99, "12m": 39.99}
+    price = prices.get(plan, 13.99)
+    await state.update_data(prem_plan=plan, total_price=price)
+    await state.set_state(PremiumStates.waiting_for_recipient)
+
+    text = (
+        f"💎 **TELEGRAM PREMIUM RECIPIENT**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Plan Duration: **{plan.upper()} Subscription**\n"
+        f"Cost: **${price:.2f} USD**\n\n"
+        f"Send the `@username` of the target user receiving Premium, or click below:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Buy For Myself", callback_data="prem_target_self", style="success")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="nav_main", style="danger")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+
+@router.callback_query(F.data == "prem_target_self")
+async def cb_prem_self(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    plan = data.get("prem_plan", "3m")
+    price = data.get("total_price", 13.99)
+    recipient = f"@{callback.from_user.username}" if callback.from_user.username else str(callback.from_user.id)
+    await show_premium_checkout(callback.message, callback.from_user.id, plan, price, recipient, state)
+
+@router.message(PremiumStates.waiting_for_recipient)
+async def process_prem_recipient_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    plan = data.get("prem_plan", "3m")
+    price = data.get("total_price", 13.99)
+    recipient = message.text.strip()
+    if not recipient.startswith("@") and not recipient.isdigit():
+        recipient = f"@{recipient}"
+    await show_premium_checkout(message, message.from_user.id, plan, price, recipient, state)
+
+async def show_premium_checkout(msg_obj, user_id: int, plan: str, price: float, recipient: str, state: FSMContext):
+    await state.clear()
+    order_id = generate_order_id()
+    
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO orders (order_id, user_id, product_type, product_id, amount, status, recipient) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (order_id, user_id, "premium", f"premium_{plan}", price, "awaiting_payment", recipient)
+        )
+        await db.commit()
+
+    text = (
+        f"📋 **PREMIUM ORDER CREATED**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 **Order ID:** `{order_id}`\n"
+        f"💎 **Package:** Premium ({plan.upper()})\n"
+        f"👤 **Target Recipient:** `{recipient}`\n"
+        f"💵 **Price:** `${price:.2f} USD`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Select payment method:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👛 Pay using Wallet Balance", callback_data=f"pay_bal_{order_id}", style="success")],
+        [InlineKeyboardButton(text="💳 Pay with OxaPay Crypto", url=f"https://oxapay.com/pay/{order_id}", style="primary")],
+        [InlineKeyboardButton(text="❌ Cancel Order", callback_data="nav_main", style="danger")]
+    ])
+    if isinstance(msg_obj, Message):
+        await msg_obj.answer(text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await msg_obj.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+
+# --- WALLET BALANCE PAYMENT HANDLER ---
+
+@router.callback_query(F.data.startswith("pay_bal_"))
+async def cb_pay_via_balance(callback: CallbackQuery):
+    order_id = callback.data.replace("pay_bal_", "")
+    user_id = callback.from_user.id
+
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        async with db.execute("SELECT amount, status, product_type, recipient FROM orders WHERE order_id = ?", (order_id,)) as cursor:
+            order = await cursor.fetchone()
+        
+        if not order:
+            await callback.answer("⚠️ Order not found.", show_alert=True)
+            return
+            
+        amount, status, ptype, recipient = order
+        if status != "awaiting_payment":
+            await callback.answer("⚠️ Order is no longer active.", show_alert=True)
+            return
+
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            user = await cursor.fetchone()
+            
+        balance = user[0] if user else 0.0
+
+        if balance < amount:
+            await callback.answer(f"❌ Insufficient balance! Required: ${amount:.2f}, Available: ${balance:.2f}", show_alert=True)
+            return
+
+        # Deduct balance atomically
+        await db.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id = ?", (amount, amount, user_id))
+        await db.execute("UPDATE orders SET status = 'completed', delivery_status = 'processing' WHERE order_id = ?", (order_id,))
+        await db.commit()
+
+    text = (
+        f"✅ **PAYMENT SUCCESSFUL**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 Order ID: `{order_id}`\n"
+        f"💵 Amount Deducted: `${amount:.2f} USD`\n"
+        f"🎯 Recipient: `{recipient}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎉 Your order is sent for fulfillment!"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Back to Menu", callback_data="nav_main", style="primary")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+
 # --- BUY BOOSTS FLOW ---
+
 @router.callback_query(F.data == "nav_buy_boosts")
 async def cb_buy_boosts(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BoostBuyStates.waiting_for_channel)
     text = (
         "⚡ **BUY CHANNEL BOOSTS**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Which channel or group should be boosted?\n\n"
-        "Please send the `@username`, `https://t.me/...` link, or invite link below:"
+        "Send the target `@username` or channel invite link below:"
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
+@router.message(BoostBuyStates.waiting_for_channel)
+async def process_boost_channel(message: Message, state: FSMContext):
+    channel = message.text.strip()
+    await state.update_data(target_channel=channel)
+    
+    text = (
+        f"⚡ **SELECT BOOST PACKAGE**\n"
+        f"Target Channel: `{channel}`\n\n"
+        "Select number of boosts:"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ 4 Boosts - $10.00", callback_data="boost_4", style="success")],
+        [InlineKeyboardButton(text="⚡ 10 Boosts - $22.00", callback_data="boost_10", style="success")],
+        [InlineKeyboardButton(text="⚡ 20 Boosts - $40.00", callback_data="boost_20", style="primary")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="nav_main", style="danger")]
+    ])
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+
 # --- SELL STARS FLOW ---
+
 @router.callback_query(F.data == "nav_sell_stars")
-async def cb_sell_stars(callback: CallbackQuery):
+async def cb_sell_stars(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SellStarsStates.waiting_for_quantity)
     text = (
         "🌟 **SELL TELEGRAM STARS**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "**Limit:** 100 - 100,000 ⭐\n\n"
-        "⚙️ **Important to know:**\n"
-        "• Transferring Stars via bot incurs standard 15% system fee.\n"
-        "• Payouts are processed smoothly to your wallet balance.\n"
+        "Payout Rate: **$0.015 USD per Star**\n"
+        "Minimum: **100 ⭐** | Maximum: **100,000 ⭐**\n\n"
+        "✍️ Type how many Stars you would like to sell:"
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+
+@router.message(SellStarsStates.waiting_for_quantity)
+async def process_sell_stars(message: Message, state: FSMContext):
+    try:
+        qty = int(message.text.strip())
+        if qty < 100 or qty > 100000:
+            raise ValueError()
+    except ValueError:
+        await message.answer("⚠️ Please enter a valid quantity between 100 and 100,000 Stars.")
+        return
+
+    payout = qty * STAR_SELL_RATE
+    await state.clear()
+    
+    text = (
+        f"🌟 **SELL ESTIMATE**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Selling: **{qty:,} Stars**\n"
+        f"You Receive: **${payout:.2f} USD**\n\n"
+        "Click below to initiate manual transfer:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌟 View Sale History", callback_data="stars_history", style="primary")],
-        [InlineKeyboardButton(text="❌ Back To Menu", callback_data="nav_main", style="danger")],
-        [InlineKeyboardButton(text="💬 Contact Support", callback_data="nav_support", style="primary")]
+        [InlineKeyboardButton(text="✅ Submit Sale Request", callback_data="submit_star_sale", style="success")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="nav_main", style="danger")]
     ])
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
 
-# --- GIVEAWAY & ADS FLOW ---
+# --- GIVEAWAYS & ADS ---
+
 @router.callback_query(F.data == "nav_giveaway")
 async def cb_giveaway(callback: CallbackQuery):
     text = (
         "🎁 **PREPAY A GIVEAWAY**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Sponsor giveaways directly for your channel or community.\n"
-        "Select prize format below:"
+        "Host sponsored giveaways for your channels:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Stars Giveaway", callback_data="ga_stars", style="success")],
@@ -336,13 +577,17 @@ async def cb_giveaway(callback: CallbackQuery):
 
 @router.callback_query(F.data == "nav_daily_giveaway")
 async def cb_daily_giveaway(callback: CallbackQuery):
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM giveaway_entries") as cursor:
+            count = (await cursor.fetchone())[0]
+
     text = (
         "🎁 **DAILY FREEBIES GIVEAWAY**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "**Prize:** 100 Telegram Stars\n"
-        "**Participants:** 617\n"
-        "**Ends In:** 04 Hours\n\n"
-        "Press the button below to join today's giveaway!"
+        "Prize: **100 Telegram Stars**\n"
+        f"Total Participants: **{count:,}**\n"
+        "Ends In: **04 Hours**\n\n"
+        "Press the button below to participate!"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎉 Enter Giveaway", callback_data="join_daily_ga", style="success")],
@@ -350,16 +595,40 @@ async def cb_daily_giveaway(callback: CallbackQuery):
     ])
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
 
-# --- WALLET & DEPOSIT FLOW ---
+@router.callback_query(F.data == "join_daily_ga")
+async def cb_join_daily(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(settings.DB_PATH) as db:
+        try:
+            await db.execute("INSERT INTO giveaway_entries (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+            await callback.answer("🎉 Entry submitted! Good luck!", show_alert=True)
+        except aiosqlite.IntegrityError:
+            await callback.answer("⚠️ You have already entered today's giveaway!", show_alert=True)
+
+@router.callback_query(F.data == "nav_ads")
+async def cb_ads(callback: CallbackQuery):
+    text = (
+        "📣 **TELEGRAM ADS & PROMOTIONS**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Promote your channels to active store users.\n\n"
+        "• Broadcast Messages\n"
+        "• Main Menu Banners\n"
+        "Contact support for pricing."
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+
+# --- WALLET & DEPOSIT SYSTEM ---
+
 @router.callback_query(F.data == "nav_wallet")
 async def cb_wallet(callback: CallbackQuery):
     user_data = await get_or_create_user(callback.from_user.id, callback.from_user.username or "", callback.from_user.first_name or "")
     text = (
         f"👛 **WALLET OVERVIEW**\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 **Available Balance:** `${user_data['balance']:.2f} USD`\n"
-        f"📥 **Total Deposited:** `${user_data['total_deposited']:.2f} USD`\n"
-        f"🛍️ **Total Spent:** `${user_data['total_spent']:.2f} USD`\n"
+        f"💰 **Balance:** `${user_data['balance']:.2f} USD`\n"
+        f"📥 **Deposited:** `${user_data['total_deposited']:.2f} USD`\n"
+        f"🛍️ **Spent:** `${user_data['total_spent']:.2f} USD`\n"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Deposit Crypto", callback_data="wallet_deposit", style="success")],
@@ -375,7 +644,7 @@ async def cb_deposit(callback: CallbackQuery, state: FSMContext):
     text = (
         "💵 **DEPOSIT FUNDS**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Please enter the deposit amount in **USD** (Minimum $5.00):"
+        "Enter deposit amount in USD (Minimum $5.00):"
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
@@ -386,7 +655,7 @@ async def process_deposit_amount(message: Message, state: FSMContext):
         if amount < 5.0:
             raise ValueError()
     except ValueError:
-        await message.answer("⚠️ Please enter a valid numerical amount (minimum $5.00).")
+        await message.answer("⚠️ Minimum deposit amount is $5.00.")
         return
 
     await state.clear()
@@ -400,39 +669,50 @@ async def process_deposit_amount(message: Message, state: FSMContext):
         await db.commit()
 
     text = (
-        f"💳 **SELECT DEPOSIT CURRENCY**\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💳 **CRYPTO DEPOSIT**\n"
         f"Order ID: `{order_id}`\n"
         f"Amount: **${amount:.2f} USD**\n\n"
-        "Select your preferred cryptocurrency gateway:"
+        "Click below to make payment via OxaPay:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="₿ BTC", url=f"https://oxapay.com/pay/{order_id}", style="primary"),
-            InlineKeyboardButton(text="Ł LTC", url=f"https://oxapay.com/pay/{order_id}", style="primary"),
-            InlineKeyboardButton(text="⟠ ETH", url=f"https://oxapay.com/pay/{order_id}", style="primary")
-        ],
-        [
-            InlineKeyboardButton(text="💎 TON", url=f"https://oxapay.com/pay/{order_id}", style="primary"),
-            InlineKeyboardButton(text="₮ USDT (TRC20)", url=f"https://oxapay.com/pay/{order_id}", style="success"),
-            InlineKeyboardButton(text="☀️ SOL", url=f"https://oxapay.com/pay/{order_id}", style="primary")
-        ],
-        [InlineKeyboardButton(text="❌ Cancel Deposit", callback_data="nav_main", style="danger")]
+        [InlineKeyboardButton(text="💳 Pay with OxaPay", url=f"https://oxapay.com/pay/{order_id}", style="success")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="nav_main", style="danger")]
     ])
     await message.answer(text, parse_mode="Markdown", reply_markup=kb)
 
-# --- SUPPORT FLOW ---
+# --- SETTINGS, LANGUAGE & SUPPORT ---
+
+@router.callback_query(F.data == "nav_settings")
+async def cb_settings(callback: CallbackQuery):
+    text = "⚙️ **BOT SETTINGS**\n\nManage notifications and preferences:"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Notifications: ON", callback_data="toggle_notif", style="success")],
+        [InlineKeyboardButton(text="❌ Back To Menu", callback_data="nav_main", style="danger")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+
+@router.callback_query(F.data == "nav_lang")
+async def cb_lang(callback: CallbackQuery):
+    text = "🌐 **SELECT LANGUAGE**\n\nChoose language:"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇺🇸 English", callback_data="lang_en", style="success")],
+        [InlineKeyboardButton(text="🇮🇳 Hindi", callback_data="lang_hi", style="primary")],
+        [InlineKeyboardButton(text="❌ Back To Menu", callback_data="nav_main", style="danger")]
+    ])
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+
 @router.callback_query(F.data == "nav_support")
 async def cb_support(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SupportStates.waiting_for_message)
     text = (
         "💬 **CUSTOMER SUPPORT**\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Describe your issue or order inquiry in detail below. Support personnel will reply directly to your chat."
+        "Type your message/inquiry below. Support will respond shortly:"
     )
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
 # --- WEBHOOK & HTTP SERVERS ---
+
 async def oxapay_webhook_handler(request: web.Request):
     signature = request.headers.get("HMAC", "")
     body = await request.read()
@@ -472,6 +752,7 @@ async def health_check_handler(request: web.Request):
     return web.json_response({"status": "ok", "bot": settings.BOT_USERNAME})
 
 # --- APPLICATION RUNNER ---
+
 async def main():
     await init_db()
     
@@ -483,7 +764,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, settings.WEBHOOK_HOST, settings.WEBHOOK_PORT)
     await site.start()
-    logger.info(f"HTTP Server active on http://{settings.WEBHOOK_HOST}:{settings.WEBHOOK_PORT}")
+    logger.info(f"HTTP Webhook Server active on http://{settings.WEBHOOK_HOST}:{settings.WEBHOOK_PORT}")
 
     logger.info("Starting Telegram Bot Polling...")
     await dp.start_polling(bot)
